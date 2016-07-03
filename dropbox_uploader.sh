@@ -51,6 +51,7 @@ API_DELETE_URL="https://api.dropbox.com/1/fileops/delete"
 API_MOVE_URL="https://api.dropbox.com/1/fileops/move"
 API_COPY_URL="https://api.dropbox.com/1/fileops/copy"
 API_METADATA_URL="https://api.dropbox.com/1/metadata"
+API_LIST_FOLDER_URL="https://api.dropbox.com/2/files/list_folder"
 API_INFO_URL="https://api.dropbox.com/1/account/info"
 API_MKDIR_URL="https://api.dropbox.com/1/fileops/create_folder"
 API_SHARES_URL="https://api.dropbox.com/1/shares"
@@ -217,7 +218,7 @@ function file_size
     if [ $? -eq 0 ]; then
         echo $SIZE
         return
-    fi   
+    fi
 
     #Some embedded linux devices
     SIZE=$(stat -c "%s" "$1" 2> /dev/null)
@@ -333,6 +334,24 @@ function check_http_response
 
     fi
 
+}
+
+function handle_fail
+{
+    print "FAILED\n"
+    echo
+    cat $1
+    echo
+    echo
+}
+
+function handle_success
+{
+    print ""
+    # echo
+    # cat $1
+    # echo
+    # echo
 }
 
 #Urlencode
@@ -991,16 +1010,26 @@ function db_mkdir
 #$1 = Remote directory
 function db_list
 {
-    local DIR_DST=$(normalize_path "$1")
+    local DIR_DST="$1"
 
     print " > Listing \"$DIR_DST\"... "
-    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i -o "$RESPONSE_FILE" "$API_METADATA_URL/$ACCESS_LEVEL/$(urlencode "$DIR_DST")?oauth_consumer_key=$APPKEY&oauth_token=$OAUTH_ACCESS_TOKEN&oauth_signature_method=PLAINTEXT&oauth_signature=$APPSECRET%26$OAUTH_ACCESS_TOKEN_SECRET&oauth_timestamp=$(utime)&oauth_nonce=$RANDOM" 2> /dev/null
+    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
+        -X POST \
+        -o "$RESPONSE_FILE" \
+        --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+        --header "Content-type: application/json" \
+        --data "{\"path\":\"$DIR_DST\"}" \
+        "$API_LIST_FOLDER_URL" 2> /dev/null
     check_http_response
+
+    # @todo Check IS_DIR by checking for "409 Conflict" (header) instead of "entries" (body)
 
     #Check
     if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
 
-        local IS_DIR=$(sed -n 's/^\(.*\)\"contents":.\[.*/\1/p' "$RESPONSE_FILE")
+        handle_success $RESPONSE_FILE
+
+        local IS_DIR=$(sed -n 's/^\(.*\)\"entries":.\[.*/\1/p' "$RESPONSE_FILE")
 
         #It's a directory
         if [[ $IS_DIR != "" ]]; then
@@ -1020,9 +1049,13 @@ function db_list
             rm -fr "$RESPONSE_FILE"
             while read -r line; do
 
-                local FILE=$(echo "$line" | sed -n 's/.*"path": *"\([^"]*\)".*/\1/p')
-                local IS_DIR=$(echo "$line" | sed -n 's/.*"is_dir": *\([^,]*\).*/\1/p')
-                local SIZE=$(convert_bytes $(echo "$line" | sed -n 's/.*"bytes": *\([0-9]*\).*/\1/p'))
+                local FILE=$(echo "$line" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+                local IS_DIR=$(echo "$line" | sed -n 's/.*".tag": *"\([^,]*\)".*/\1/p')
+                if [[ $IS_DIR == "folder" ]]; then
+                    SIZE="0"
+                else
+                    local SIZE=$(convert_bytes $(echo "$line" | sed -n 's/.*"size": *\([0-9]*\).*/\1/p'))
+                fi
 
                 echo -e "$FILE:$IS_DIR;$SIZE" >> "$RESPONSE_FILE"
 
@@ -1052,7 +1085,7 @@ function db_list
                 #Removing unneeded /
                 FILE=${FILE##*/}
 
-                if [[ $TYPE == "true" ]]; then
+                if [[ $TYPE == "folder" ]]; then
                     FILE=$(echo -e "$FILE")
                     $PRINTF " [D] %-${padding}s %s\n" "$SIZE" "$FILE"
                 fi
@@ -1070,7 +1103,7 @@ function db_list
                 #Removing unneeded /
                 FILE=${FILE##*/}
 
-                if [[ $TYPE == "false" ]]; then
+                if [[ $TYPE == "file" ]]; then
                     FILE=$(echo -e "$FILE")
                     $PRINTF " [F] %-${padding}s %s\n" "$SIZE" "$FILE"
                 fi
@@ -1084,7 +1117,7 @@ function db_list
         fi
 
     else
-        print "FAILED\n"
+        handle_fail $RESPONSE_FILE
         ERROR_STATUS=1
     fi
 }
@@ -1122,7 +1155,7 @@ if [[ -e $CONFIG_FILE ]]; then
     }
 
     #Checking the loaded data
-    if [[ $APPKEY == "" || $APPSECRET == "" || $OAUTH_ACCESS_TOKEN_SECRET == "" || $OAUTH_ACCESS_TOKEN == "" ]]; then
+    if [[ $OAUTH_ACCESS_TOKEN == "" ]]; then
         echo -ne "Error loading data from $CONFIG_FILE...\n"
         echo -ne "It is recommended to run $0 unlink\n"
         remove_temp_files
@@ -1133,6 +1166,9 @@ if [[ -e $CONFIG_FILE ]]; then
     if [[ $ACCESS_LEVEL == "" ]]; then
         ACCESS_LEVEL="dropbox"
     fi
+
+    # CURL_HEADER_AUTHORIZATION="--header \"Authorization: Bearer $OAUTH_ACCESS_TOKEN\""
+    # CURL_HEADER_CONTENT_TYPE="--header \"Content-type: application/json\""
 
 #NEW SETUP...
 else
@@ -1357,11 +1393,11 @@ case $COMMAND in
         DIR_DST=$ARG1
 
         #Checking DIR_DST
-        if [[ $DIR_DST == "" ]]; then
-            DIR_DST="/"
-        fi
+        # if [[ $DIR_DST == "" ]]; then
+        #     DIR_DST="/"
+        # fi
 
-        db_list "/$DIR_DST"
+        db_list "$DIR_DST"
 
     ;;
 
