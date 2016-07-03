@@ -329,7 +329,7 @@ function check_http_response
 
 function handle_fail
 {
-    print "FAILED\n"
+    print ""
     echo
     cat $1
     echo
@@ -1007,17 +1007,15 @@ function db_list
         "$API_LIST_FOLDER_URL" 2> /dev/null
     check_http_response
 
-    # @todo Check IS_DIR by checking for "409 Conflict" (header) instead of "entries" (body)
+    if grep -q "^HTTP/1.1 409 Conflict" "$RESPONSE_FILE"; then
+        local ERROR=$(cat "$RESPONSE_FILE" | sed -n 's/.*"error_summary": *"\([^"]*\)".*/\1/p')
+        print "FAILED: $ERROR\n"
+        handle_fail $RESPONSE_FILE
+        ERROR_STATUS=1
+    else
+        if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
 
-    #Check
-    if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
-
-        handle_success $RESPONSE_FILE
-
-        local IS_DIR=$(sed -n 's/^\(.*\)\"entries":.\[.*/\1/p' "$RESPONSE_FILE")
-
-        #It's a directory
-        if [[ $IS_DIR != "" ]]; then
+            handle_success $RESPONSE_FILE
 
             print "DONE\n"
 
@@ -1094,16 +1092,7 @@ function db_list
                 fi
 
             done < "$RESPONSE_FILE"
-
-        #It's a file
-        else
-            print "FAILED: $DIR_DST is not a directory!\n"
-            ERROR_STATUS=1
         fi
-
-    else
-        handle_fail $RESPONSE_FILE
-        ERROR_STATUS=1
     fi
 }
 
