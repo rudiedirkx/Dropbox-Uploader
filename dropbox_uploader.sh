@@ -1092,6 +1092,10 @@ function db_list
                 fi
 
             done < "$RESPONSE_FILE"
+        else
+            print "FAILED\n"
+            handle_fail $RESPONSE_FILE
+            ERROR_STATUS=1
         fi
     fi
 }
