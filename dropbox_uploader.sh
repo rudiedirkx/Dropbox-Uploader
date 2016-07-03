@@ -52,7 +52,8 @@ API_MOVE_URL="https://api.dropbox.com/1/fileops/move"
 API_COPY_URL="https://api.dropbox.com/1/fileops/copy"
 API_METADATA_URL="https://api.dropbox.com/1/metadata"
 API_LIST_FOLDER_URL="https://api.dropbox.com/2/files/list_folder"
-API_INFO_URL="https://api.dropbox.com/1/account/info"
+API_INFO_URL="https://api.dropbox.com/2/users/get_current_account"
+API_USAGE_URL="https://api.dropbox.com/2/users/get_space_usage"
 API_MKDIR_URL="https://api.dropbox.com/1/fileops/create_folder"
 API_SHARES_URL="https://api.dropbox.com/1/shares"
 API_SAVEURL_URL="https://api.dropbox.com/1/save_url/auto"
@@ -848,31 +849,54 @@ function db_account_info
 {
     print "Dropbox Uploader v$VERSION\n\n"
     print " > Getting info... "
-    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i -o "$RESPONSE_FILE" --data "oauth_consumer_key=$APPKEY&oauth_token=$OAUTH_ACCESS_TOKEN&oauth_signature_method=PLAINTEXT&oauth_signature=$APPSECRET%26$OAUTH_ACCESS_TOKEN_SECRET&oauth_timestamp=$(utime)&oauth_nonce=$RANDOM" "$API_INFO_URL" 2> /dev/null
+    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
+        -X POST \
+        -o "$RESPONSE_FILE" \
+        --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+        --header "Content-type: application/json" \
+        --data "null" \
+        "$API_INFO_URL" 2> /dev/null
     check_http_response
 
     #Check
     if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
 
+        handle_success "$RESPONSE_FILE"
+
         name=$(sed -n 's/.*"display_name": "\([^"]*\).*/\1/p' "$RESPONSE_FILE")
         echo -e "\n\nName:\t$name"
 
-        uid=$(sed -n 's/.*"uid": \([0-9]*\).*/\1/p' "$RESPONSE_FILE")
+        uid=$(sed -n 's/.*"account_id": "\([^"]*\).*/\1/p' "$RESPONSE_FILE")
         echo -e "UID:\t$uid"
 
         email=$(sed -n 's/.*"email": "\([^"]*\).*/\1/p' "$RESPONSE_FILE")
         echo -e "Email:\t$email"
 
-        quota=$(sed -n 's/.*"quota": \([0-9]*\).*/\1/p' "$RESPONSE_FILE")
-        let quota_mb=$quota/1024/1024
-        echo -e "Quota:\t$quota_mb Mb"
+        $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
+            -X POST \
+            -o "$RESPONSE_FILE.p2" \
+            --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+            --header "Content-type: application/json" \
+            --data "null" \
+            "$API_USAGE_URL" 2> /dev/null
+        check_http_response
 
-        used=$(sed -n 's/.*"normal": \([0-9]*\).*/\1/p' "$RESPONSE_FILE")
-        let used_mb=$used/1024/1024
-        echo -e "Used:\t$used_mb Mb"
+        if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE.p2"; then
+            handle_success "$RESPONSE_FILE.p2"
 
-        let free_mb=($quota-$used)/1024/1024
-        echo -e "Free:\t$free_mb Mb"
+            echo ""
+
+            quota=$(sed -n 's/.*"allocated": \([0-9]*\).*/\1/p' "$RESPONSE_FILE.p2")
+            let quota_gb=$quota/1024/1024/1024
+            echo -e "Quota:\t$quota_gb GB"
+
+            used=$(sed -n 's/.*"used": \([0-9]*\).*/\1/p' "$RESPONSE_FILE.p2")
+            let used_gb=$used/1024/1024/1024
+            echo -e "Used:\t$used_gb GB"
+
+            let free_gb=($quota-$used)/1024/1024/1024
+            echo -e "Free:\t$free_gb GB"
+        fi
 
         echo ""
 
@@ -1021,7 +1045,7 @@ function db_list
     else
         if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
 
-            handle_success $RESPONSE_FILE
+            handle_success "$RESPONSE_FILE"
 
             print "DONE\n"
 
