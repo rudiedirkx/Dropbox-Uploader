@@ -22,10 +22,13 @@
 #Default configuration file
 CONFIG_FILE=~/.dropbox_uploader
 
-#Default chunk size in Mb for the upload process
+#Max filesize in MB to upload in a single request. If bigger than this, chunk uploading is used
+MAX_SINGLE_UPLOAD_SIZE=15
+
+#Default chunk size in MB for the upload process
 #It is recommended to increase this value only if you have enough free space on your /tmp partition
 #Lower values may increase the number of http requests
-CHUNK_SIZE=4
+CHUNK_SIZE=5
 
 #Curl location
 #If not set, curl will be searched into the $PATH
@@ -43,14 +46,15 @@ ERROR_STATUS=0
 API_REQUEST_TOKEN_URL="https://api.dropbox.com/1/oauth/request_token"
 API_USER_AUTH_URL="https://www.dropbox.com/1/oauth/authorize"
 API_ACCESS_TOKEN_URL="https://api.dropbox.com/1/oauth/access_token"
-API_CHUNKED_UPLOAD_URL="https://api-content.dropbox.com/1/chunked_upload"
-API_CHUNKED_UPLOAD_COMMIT_URL="https://api-content.dropbox.com/1/commit_chunked_upload"
-API_UPLOAD_URL="https://api-content.dropbox.com/1/files_put"
+API_CHUNKED_UPLOAD_START_URL="https://content.dropboxapi.com/2/files/upload_session/start"
+API_CHUNKED_UPLOAD_URL="https://content.dropboxapi.com/2/files/upload_session/append_v2"
+API_CHUNKED_UPLOAD_COMMIT_URL="https://content.dropboxapi.com/2/files/upload_session/finish"
+API_SINGLE_UPLOAD_URL="https://content.dropboxapi.com/2/files/upload"
 API_DOWNLOAD_URL="https://api-content.dropbox.com/1/files"
 API_DELETE_URL="https://api.dropbox.com/1/fileops/delete"
 API_MOVE_URL="https://api.dropbox.com/1/fileops/move"
 API_COPY_URL="https://api.dropbox.com/1/fileops/copy"
-API_METADATA_URL="https://api.dropbox.com/1/metadata"
+API_METADATA_URL="https://api.dropbox.com/2/files/get_metadata"
 API_LIST_FOLDER_URL="https://api.dropbox.com/2/files/list_folder"
 API_INFO_URL="https://api.dropbox.com/2/users/get_current_account"
 API_USAGE_URL="https://api.dropbox.com/2/users/get_space_usage"
@@ -328,7 +332,7 @@ function check_http_response
 
 }
 
-function handle_fail
+function debug_fail
 {
     print ""
     echo
@@ -337,7 +341,7 @@ function handle_fail
     echo
 }
 
-function handle_success
+function debug_success
 {
     print ""
     # echo
@@ -366,7 +370,13 @@ function urlencode
     echo "$encoded"
 }
 
-function normalize_path
+function normalize_local_path
+{
+    path=$($PRINTF "${1//\/\///}")
+    echo "$path"
+}
+
+function normalize_remote_path
 {
     #The printf is necessary to correctly decode unicode sequences
     path=$($PRINTF "${1//\/\///}")
@@ -382,32 +392,27 @@ function normalize_path
 #Returns FILE/DIR/ERR
 function db_stat
 {
-    local FILE=$(normalize_path "$1")
+    local FILE=$(normalize_remote_path "$1")
 
     #Checking if it's a file or a directory
-    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i -o "$RESPONSE_FILE" "$API_METADATA_URL/$ACCESS_LEVEL/$(urlencode "$FILE")?oauth_consumer_key=$APPKEY&oauth_token=$OAUTH_ACCESS_TOKEN&oauth_signature_method=PLAINTEXT&oauth_signature=$APPSECRET%26$OAUTH_ACCESS_TOKEN_SECRET&oauth_timestamp=$(utime)&oauth_nonce=$RANDOM" 2> /dev/null
+    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
+        -o "$RESPONSE_FILE" \
+        --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+        --header "Content-type: application/json" \
+        --data "{\"path\":\"$FILE\",\"include_deleted\":false}" \
+        "$API_METADATA_URL" 2> /dev/null
     check_http_response
 
-    #Even if the file/dir has been deleted from DropBox we receive a 200 OK response
-    #So we must check if the file exists or if it has been deleted
-    if grep -q "\"is_deleted\":" "$RESPONSE_FILE"; then
-        local IS_DELETED=$(sed -n 's/.*"is_deleted":.\([^,]*\).*/\1/p' "$RESPONSE_FILE")
-    else
-        local IS_DELETED="false"
-    fi
+    # debug_success "$RESPONSE_FILE"
 
-    #Exits...
-    grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"
-    if [[ $? == 0 && $IS_DELETED != "true" ]]; then
+    if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
 
-        local IS_DIR=$(sed -n 's/^\(.*\)\"contents":.\[.*/\1/p' "$RESPONSE_FILE")
+        local TYPE=$(sed -n 's/.*".tag": "\([^"]*\).*/\1/p' "$RESPONSE_FILE")
 
-        #It's a directory
-        if [[ $IS_DIR != "" ]]; then
-            echo "DIR"
-        #It's a file
-        else
+        if [[ "$TYPE" == "file" ]]; then
             echo "FILE"
+        else
+            echo "DIR"
         fi
 
     #Doesn't exists
@@ -421,8 +426,13 @@ function db_stat
 #$2 = Remote destination file/dir
 function db_upload
 {
-    local SRC=$(normalize_path "$1")
-    local DST=$(normalize_path "$2")
+    local SRC=$(normalize_local_path "$1")
+    local DST=$(normalize_remote_path "$2")
+
+    local DST_IS_DIR=false
+    if [[ "${2: -1}" == "/" ]]; then
+        DST_IS_DIR=true
+    fi
 
     #Checking if the file/dir exists
     if [[ ! -e $SRC && ! -d $SRC ]]; then
@@ -445,13 +455,13 @@ function db_upload
         DST="$DST"
 
     #if DST doesn't exists and doesn't ends with a /, it will be the destination file name
-    elif [[ $TYPE == "ERR" && "${DST: -1}" != "/" ]]; then
-        DST="$DST"
-
-    #if DST doesn't exists and ends with a /, it will be the destination folder
-    elif [[ $TYPE == "ERR" && "${DST: -1}" == "/" ]]; then
-        local filename=$(basename "$SRC")
-        DST="$DST/$filename"
+    elif [[ $TYPE == "ERR" ]]; then
+        if [[ $DST_IS_DIR == false ]]; then
+            DST="$DST"
+        else
+            local filename=$(basename "$SRC")
+            DST="$DST/$filename"
+        fi
 
     #If DST it'a directory, it will be the destination folder
     elif [[ $TYPE == "DIR" ]]; then
@@ -479,8 +489,8 @@ function db_upload
 #$2 = Remote destination file
 function db_upload_file
 {
-    local FILE_SRC=$(normalize_path "$1")
-    local FILE_DST=$(normalize_path "$2")
+    local FILE_SRC=$(normalize_local_path "$1")
+    local FILE_DST=$(normalize_remote_path "$2")
 
     shopt -s nocasematch
 
@@ -503,14 +513,15 @@ function db_upload_file
     FILE_SIZE=$(file_size "$FILE_SRC")
 
     #Checking if the file already exists
-    TYPE=$(db_stat "$FILE_DST")
-    if [[ $TYPE != "ERR" && $SKIP_EXISTING_FILES == 1 ]]; then
-        print " > Skipping already existing file \"$FILE_DST\"\n"
-        return
+    if [[ $SKIP_EXISTING_FILES == 1 ]]; then
+        TYPE=$(db_stat "$FILE_DST")
+        if [[ $TYPE != "ERR" ]]; then
+            print " > Skipping already existing file \"$FILE_DST\"\n"
+            return
+        fi
     fi
 
-    if [[ $FILE_SIZE -gt 157286000 ]]; then
-        #If the file is greater than 150Mb, the chunked_upload API will be used
+    if [[ $FILE_SIZE -gt $MAX_SINGLE_UPLOAD_SIZE*1024*1024 ]]; then
         db_chunked_upload_file "$FILE_SRC" "$FILE_DST"
     else
         db_simple_upload_file "$FILE_SRC" "$FILE_DST"
@@ -523,8 +534,8 @@ function db_upload_file
 #$2 = Remote destination file
 function db_simple_upload_file
 {
-    local FILE_SRC=$(normalize_path "$1")
-    local FILE_DST=$(normalize_path "$2")
+    local FILE_SRC=$(normalize_local_path "$1")
+    local FILE_DST=$(normalize_remote_path "$2")
 
     if [[ $SHOW_PROGRESSBAR == 1 && $QUIET == 0 ]]; then
         CURL_PARAMETERS="--progress-bar"
@@ -535,15 +546,22 @@ function db_simple_upload_file
     fi
 
     print " > Uploading \"$FILE_SRC\" to \"$FILE_DST\"... $LINE_CR"
-    $CURL_BIN $CURL_ACCEPT_CERTIFICATES $CURL_PARAMETERS -i --globoff -o "$RESPONSE_FILE" --upload-file "$FILE_SRC" "$API_UPLOAD_URL/$ACCESS_LEVEL/$(urlencode "$FILE_DST")?oauth_consumer_key=$APPKEY&oauth_token=$OAUTH_ACCESS_TOKEN&oauth_signature_method=PLAINTEXT&oauth_signature=$APPSECRET%26$OAUTH_ACCESS_TOKEN_SECRET&oauth_timestamp=$(utime)&oauth_nonce=$RANDOM"
+    $CURL_BIN $CURL_ACCEPT_CERTIFICATES $CURL_PARAMETERS -i --globoff \
+        -o "$RESPONSE_FILE" \
+        --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+        --header "Content-type: application/octet-stream" \
+        --header "Dropbox-API-Arg: {\"path\":\"$FILE_DST\",\"mode\":\"overwrite\"}" \
+        --data-binary "@$FILE_SRC" \
+        "$API_SINGLE_UPLOAD_URL"
     check_http_response
 
     #Check
     if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
         print "DONE\n"
+        debug_success "$RESPONSE_FILE"
     else
         print "FAILED\n"
-        print "An error occurred requesting /upload\n"
+        debug_fail "$RESPONSE_FILE"
         ERROR_STATUS=1
     fi
 }
@@ -553,84 +571,80 @@ function db_simple_upload_file
 #$2 = Remote destination file
 function db_chunked_upload_file
 {
-    local FILE_SRC=$(normalize_path "$1")
-    local FILE_DST=$(normalize_path "$2")
+    local FILE_SRC=$(normalize_local_path "$1")
+    local FILE_DST=$(normalize_remote_path "$2")
 
     print " > Uploading \"$FILE_SRC\" to \"$FILE_DST\""
 
     local FILE_SIZE=$(file_size "$FILE_SRC")
     local OFFSET=0
-    local UPLOAD_ID=""
-    local UPLOAD_ERROR=0
-    local CHUNK_PARAMS=""
+    local SESSION_ID=""
+
+    #Start upload session and send chunk 1
+    dd if="$FILE_SRC" of="$CHUNK_FILE" bs=1048576 skip=0 count=$CHUNK_SIZE 2> /dev/null
+    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
+        -o "$RESPONSE_FILE" \
+        --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+        --header "Content-type: application/octet-stream" \
+        --data-binary "@$CHUNK_FILE" \
+        "$API_CHUNKED_UPLOAD_START_URL"
+
+    # @todo Add upload fail redundancy
+    # @todo Add upload progress, if -p
+
+    debug_success "$RESPONSE_FILE"
+
+    #Progress
+    print "."
+
+    SESSION_ID=$(sed -n 's/.*"session_id": "\([^"]*\).*/\1/p' "$RESPONSE_FILE")
+
+    let "OFFSET += $(file_size $CHUNK_FILE)"
 
     #Uploading chunks...
     while ([[ $OFFSET != $FILE_SIZE ]]); do
 
+        #Create another chunk
         let OFFSET_MB=$OFFSET/1024/1024
-
-        #Create the chunk
         dd if="$FILE_SRC" of="$CHUNK_FILE" bs=1048576 skip=$OFFSET_MB count=$CHUNK_SIZE 2> /dev/null
 
-        #Only for the first request these parameters are not included
-        if [[ $OFFSET != 0 ]]; then
-            CHUNK_PARAMS="upload_id=$UPLOAD_ID&offset=$OFFSET"
-        fi
-
         #Uploading the chunk...
-        echo > "$RESPONSE_FILE"
-        $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i -o "$RESPONSE_FILE" --upload-file "$CHUNK_FILE" "$API_CHUNKED_UPLOAD_URL?$CHUNK_PARAMS&oauth_consumer_key=$APPKEY&oauth_token=$OAUTH_ACCESS_TOKEN&oauth_signature_method=PLAINTEXT&oauth_signature=$APPSECRET%26$OAUTH_ACCESS_TOKEN_SECRET&oauth_timestamp=$(utime)&oauth_nonce=$RANDOM" 2> /dev/null
-        #check_http_response not needed, because we have to retry the request in case of error
+        $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
+            -o "$RESPONSE_FILE" \
+            --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+            --header "Content-type: application/octet-stream" \
+            --header "Dropbox-API-Arg: {\"cursor\":{\"session_id\":\"$SESSION_ID\",\"offset\":$OFFSET}}" \
+            --data-binary "@$CHUNK_FILE" \
+            "$API_CHUNKED_UPLOAD_URL"
+
+        debug_success "$RESPONSE_FILE"
 
         #Check
         if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
+            #Progress
             print "."
-            UPLOAD_ERROR=0
-            UPLOAD_ID=$(sed -n 's/.*"upload_id": *"*\([^"]*\)"*.*/\1/p' "$RESPONSE_FILE")
-            OFFSET=$(sed -n 's/.*"offset": *\([^}]*\).*/\1/p' "$RESPONSE_FILE")
-        else
-            print "*"
-            let UPLOAD_ERROR=$UPLOAD_ERROR+1
 
-            #On error, the upload is retried for max 3 times
-            if [[ $UPLOAD_ERROR -gt 2 ]]; then
-                print " FAILED\n"
-                print "An error occurred requesting /chunked_upload\n"
-                ERROR_STATUS=1
-                return
-            fi
+            let "OFFSET += $(file_size $CHUNK_FILE)"
+        else
+            echo
+            echo "CHUNK FAILED. Aborting..."
+            echo
+
+            return
         fi
 
     done
 
-    UPLOAD_ERROR=0
+    #Commit file
+    $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
+        -o "$RESPONSE_FILE" \
+        --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+        --header "Content-type: application/octet-stream" \
+        --header "Dropbox-API-Arg: {\"cursor\":{\"session_id\":\"$SESSION_ID\",\"offset\":$OFFSET},\"commit\":{\"path\":\"$FILE_DST\",\"mode\":\"overwrite\"}}" \
+        --data "" \
+        "$API_CHUNKED_UPLOAD_COMMIT_URL"
 
-    #Commit the upload
-    while (true); do
-
-        echo > "$RESPONSE_FILE"
-        $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i -o "$RESPONSE_FILE" --data "upload_id=$UPLOAD_ID&oauth_consumer_key=$APPKEY&oauth_token=$OAUTH_ACCESS_TOKEN&oauth_signature_method=PLAINTEXT&oauth_signature=$APPSECRET%26$OAUTH_ACCESS_TOKEN_SECRET&oauth_timestamp=$(utime)&oauth_nonce=$RANDOM" "$API_CHUNKED_UPLOAD_COMMIT_URL/$ACCESS_LEVEL/$(urlencode "$FILE_DST")" 2> /dev/null
-        #check_http_response not needed, because we have to retry the request in case of error
-
-        #Check
-        if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
-            print "."
-            UPLOAD_ERROR=0
-            break
-        else
-            print "*"
-            let UPLOAD_ERROR=$UPLOAD_ERROR+1
-
-            #On error, the commit is retried for max 3 times
-            if [[ $UPLOAD_ERROR -gt 2 ]]; then
-                print " FAILED\n"
-                print "An error occurred requesting /commit_chunked_upload\n"
-                ERROR_STATUS=1
-                return
-            fi
-        fi
-
-    done
+    debug_success "$RESPONSE_FILE"
 
     print " DONE\n"
 }
@@ -861,7 +875,7 @@ function db_account_info
     #Check
     if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
 
-        handle_success "$RESPONSE_FILE"
+        debug_success "$RESPONSE_FILE"
 
         name=$(sed -n 's/.*"display_name": "\([^"]*\).*/\1/p' "$RESPONSE_FILE")
         echo -e "\n\nName:\t$name"
@@ -882,7 +896,7 @@ function db_account_info
         check_http_response
 
         if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE.p2"; then
-            handle_success "$RESPONSE_FILE.p2"
+            debug_success "$RESPONSE_FILE.p2"
 
             echo ""
 
@@ -1020,7 +1034,7 @@ function db_mkdir
 #$2 = Recursive?
 function db_list
 {
-    local DIR_DST=$(normalize_path "$1")
+    local DIR_DST=$(normalize_remote_path "$1")
 
     recursive=""
     if [[ "$2" == "1" ]]; then
@@ -1040,12 +1054,12 @@ function db_list
     if grep -q "^HTTP/1.1 409 Conflict" "$RESPONSE_FILE"; then
         local ERROR=$(cat "$RESPONSE_FILE" | sed -n 's/.*"error_summary": *"\([^"]*\)".*/\1/p')
         print "FAILED: $ERROR\n"
-        handle_fail $RESPONSE_FILE
+        debug_fail $RESPONSE_FILE
         ERROR_STATUS=1
     else
         if grep -q "^HTTP/1.1 200 OK" "$RESPONSE_FILE"; then
 
-            handle_success "$RESPONSE_FILE"
+            debug_success "$RESPONSE_FILE"
 
             print "DONE\n"
 
@@ -1128,7 +1142,7 @@ function db_list
             done < "$RESPONSE_FILE"
         else
             print "FAILED\n"
-            handle_fail $RESPONSE_FILE
+            debug_fail $RESPONSE_FILE
             ERROR_STATUS=1
         fi
     fi
