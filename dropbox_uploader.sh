@@ -993,9 +993,15 @@ function db_mkdir
 
 #List remote directory
 #$1 = Remote directory
+#$2 = Recursive?
 function db_list
 {
     local DIR_DST=$(normalize_path "$1")
+
+    recursive=""
+    if [[ "$2" == "1" ]]; then
+        recursive=',"recursive":true'
+    fi
 
     print " > Listing \"$DIR_DST\"... "
     $CURL_BIN $CURL_ACCEPT_CERTIFICATES -L -s --show-error --globoff -i \
@@ -1003,7 +1009,7 @@ function db_list
         -o "$RESPONSE_FILE" \
         --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
         --header "Content-type: application/json" \
-        --data "{\"path\":\"$DIR_DST\"}" \
+        --data "{\"path\":\"$DIR_DST\"$recursive}" \
         "$API_LIST_FOLDER_URL" 2> /dev/null
     check_http_response
 
@@ -1032,7 +1038,7 @@ function db_list
             rm -fr "$RESPONSE_FILE"
             while read -r line; do
 
-                local FILE=$(echo "$line" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+                local FILE=$(echo "$line" | sed -n 's/.*"path_display": *"\([^"]*\)".*/\1/p')
                 local IS_DIR=$(echo "$line" | sed -n 's/.*".tag": *"\([^,]*\)".*/\1/p')
                 if [[ $IS_DIR == "folder" ]]; then
                     SIZE="0"
@@ -1066,7 +1072,9 @@ function db_list
                 local SIZE=${META#*;}
 
                 #Removing unneeded /
-                FILE=${FILE##*/}
+                if [[ "$recursive" == "" ]]; then
+                    FILE=${FILE##*/}
+                fi
 
                 if [[ $TYPE == "folder" ]]; then
                     FILE=$(echo -e "$FILE")
@@ -1084,7 +1092,9 @@ function db_list
                 local SIZE=${META#*;}
 
                 #Removing unneeded /
-                FILE=${FILE##*/}
+                if [[ "$recursive" == "" ]]; then
+                    FILE=${FILE##*/}
+                fi
 
                 if [[ $TYPE == "file" ]]; then
                     FILE=$(echo -e "$FILE")
@@ -1370,12 +1380,15 @@ case $COMMAND in
 
         DIR_DST=$ARG1
 
-        #Checking DIR_DST
-        # if [[ $DIR_DST == "" ]]; then
-        #     DIR_DST="/"
-        # fi
+        db_list "$DIR_DST" 0
 
-        db_list "$DIR_DST"
+    ;;
+
+    list-recursive)
+
+        DIR_DST=$ARG1
+
+        db_list "$DIR_DST" 1
 
     ;;
 
